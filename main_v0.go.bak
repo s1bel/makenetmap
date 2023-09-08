@@ -1,0 +1,249 @@
+package main
+
+import (
+	"fmt"
+	"github.com/gosnmp/gosnmp"
+	"net"
+	"os/exec"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/go-ping/ping"
+)
+
+const (
+	subnet      = "192.168.0.0/22"
+	concurrency = 20
+	pingTimeout = 2 // в секундах
+)
+
+func main() {
+	ipNet, err := parseSubnet(subnet)
+	if err != nil {
+		fmt.Println("Ошибка разбора подсети:", err)
+		return
+	}
+
+	activeHosts := scanSubnet(ipNet, concurrency)
+
+	fmt.Println("Список активных хостов:")
+	printSortedActiveHosts(activeHosts)
+}
+
+func parseSubnet(subnet string) (*net.IPNet, error) {
+	_, ipNet, err := net.ParseCIDR(subnet)
+	return ipNet, err
+}
+
+func scanSubnet(ipNet *net.IPNet, concurrency int) map[string]string {
+	activeHosts := &sync.Map{}
+	hostNames := make(map[string]string)
+	var wg sync.WaitGroup
+	addresses := generateIPs(ipNet)
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			scanSubnetWorker(activeHosts, addresses, id, hostNames)
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Создайте карту для хранения имен хостов
+	hostNameMap := make(map[string]string)
+	activeHosts.Range(func(key, value interface{}) bool {
+		host := key.(string)
+		if name, ok := hostNames[host]; ok {
+			hostNameMap[host] = name
+		}
+		return true
+	})
+
+	return hostNameMap
+}
+
+func getHostName(host string) (string, error) {
+	snmpName, err := querySNMPName(host)
+	if err == nil && snmpName != "" {
+		return snmpName, nil
+	}
+
+	netbiosName, err := queryNetBIOSName(host)
+	if err == nil && netbiosName != "" {
+		return netbiosName, nil
+	}
+
+	return host, nil
+}
+func generateIPs(ipNet *net.IPNet) <-chan string {
+	addresses := make(chan string)
+
+	go func() {
+		defer close(addresses)
+
+		for ip := ipNet.IP.Mask(ipNet.Mask); ipNet.Contains(ip); incrementIP(ip) {
+			addresses <- ip.String()
+		}
+	}()
+
+	return addresses
+}
+
+func scanSubnetWorker(activeHosts *sync.Map, addresses <-chan string, id int, hostNames map[string]string) {
+	for host := range addresses {
+		if isHostActive(host) {
+			activeHosts.Store(host, true)
+			name, err := getHostName(host)
+			if err == nil {
+				hostNames[host] = name
+			}
+		}
+		fmt.Printf("Горутина %d сканирует: %s\n", id, host)
+	}
+}
+
+func isHostActive(host string) bool {
+	// Проверяем активность хоста с помощью ICMP
+	pinger, err := ping.NewPinger(host)
+	if err != nil {
+		fmt.Println("Ошибка создания Pinger:", err)
+		return false
+	}
+
+	pinger.Count = 1
+	pinger.Timeout = timeoutDuration(pingTimeout)
+
+	err = pinger.Run()
+	if err != nil {
+		fmt.Println("Ошибка выполнения ICMP-запроса:", err)
+		return false
+	}
+
+	active := pinger.Statistics().PacketsRecv > 0
+
+	// Опрашиваем имя хоста через SNMP
+	if active {
+		fmt.Printf("Опрашиваем хост %s\n", host)
+		snmpName, err := querySNMPName(host)
+		if err == nil {
+			fmt.Printf("Имя хоста %s: %s\n", host, snmpName)
+		} else {
+			fmt.Println(err)
+		}
+		netbiosName, err := queryNetBIOSName(host)
+		if err == nil {
+			fmt.Printf("Имя хоста %s: %s\n", host, netbiosName)
+		} else {
+			fmt.Println(err)
+		}
+	}
+
+	return active
+}
+
+func queryNetBIOSName(host string) (string, error) {
+	cmd := exec.Command("nbtscan", host)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", err
+	}
+
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, host) {
+			parts := strings.Fields(line)
+			if len(parts) > 1 {
+				return parts[1], nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("не удалось получить имя хоста через nbtscan")
+}
+
+func querySNMPName(host string) (string, error) {
+	params := &gosnmp.GoSNMP{
+		Target:    host,
+		Port:      161,
+		Community: "public", // Замените на ваше сообщество SNMP
+		Version:   gosnmp.Version2c,
+	}
+
+	err := params.Connect()
+	if err != nil {
+		return "", err
+	}
+	defer params.Conn.Close()
+
+	oid := ".1.3.6.1.2.1.1.5.0" // OID для имени хоста
+
+	response, err := params.Get([]string{oid})
+	if err != nil {
+		return "", err
+	}
+
+	if len(response.Variables) > 0 {
+		return response.Variables[0].Value.(string), nil
+	}
+
+	return "", fmt.Errorf("не удалось получить имя хоста")
+}
+
+func timeoutDuration(seconds int) time.Duration {
+	return time.Duration(seconds) * time.Second
+}
+
+func incrementIP(ip net.IP) {
+	for j := len(ip) - 1; j >= 0; j-- {
+		ip[j]++
+		if ip[j] > 0 {
+			break
+		}
+	}
+}
+
+func printSortedActiveHosts(activeHosts map[string]string) {
+	// Создаем слайс для сортировки
+	var hosts []string
+
+	for host := range activeHosts {
+		hosts = append(hosts, host)
+	}
+
+	// Определяем функцию сравнения для сортировки
+	sort.Slice(hosts, func(i, j int) bool {
+		ip1 := net.ParseIP(hosts[i]).To4()
+		ip2 := net.ParseIP(hosts[j]).To4()
+		return compareIPs(ip1, ip2) < 0
+	})
+
+	// Выводим отсортированный список
+	for _, host := range hosts {
+		fmt.Printf("%s[address = \"%s\"];\n", activeHosts[host], host)
+	}
+}
+
+// Функция для сравнения двух IP-адресов
+func compareIPs(ip1, ip2 net.IP) int {
+	// Преобразовываем IP-адреса в числовой формат
+	ip1Parts := strings.Split(ip1.String(), ".")
+	ip2Parts := strings.Split(ip2.String(), ".")
+
+	for i := 0; i < 4; i++ {
+		ip1Value, _ := strconv.Atoi(ip1Parts[i])
+		ip2Value, _ := strconv.Atoi(ip2Parts[i])
+
+		if ip1Value < ip2Value {
+			return -1
+		} else if ip1Value > ip2Value {
+			return 1
+		}
+	}
+
+	return 0
+}
