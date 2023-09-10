@@ -1,8 +1,8 @@
 package main
 
 import (
+	"flag"
 	"fmt"
-	"github.com/gosnmp/gosnmp"
 	"net"
 	"os"
 	"os/exec"
@@ -12,23 +12,29 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gosnmp/gosnmp"
+
 	"github.com/go-ping/ping"
 )
 
-const (
-	subnet      = "192.168.0.0/22"
-	concurrency = 20
-	pingTimeout = 2 // в секундах
+var (
+	Concurrency = flag.Int("conc", 10, "How many goroutines are executed")
+	PingTimeout = flag.Int("time", 2, "ICMP responce timeout in seconds")
+	OutFilename = flag.String("outFile", "netmap.puml", "a PlantUML file with list of hosts")
+	Subnet      = flag.String("range", "192.168.0.0/24", "the range of scanned hosts in form of '192.168.0.0/24'")
 )
 
 func main() {
-	ipNet, err := parseSubnet(subnet)
+
+	flag.Parse()
+
+	ipNet, err := parseSubnet(*Subnet)
 	if err != nil {
 		fmt.Println("Ошибка разбора подсети:", err)
 		return
 	}
 
-	activeHosts := scanSubnet(ipNet, concurrency)
+	activeHosts := scanSubnet(ipNet, *Concurrency)
 
 	fmt.Println("Список активных хостов:")
 	hosts := sortActiveHosts(activeHosts)
@@ -38,7 +44,7 @@ func main() {
 	}
 
 	// Вызываем функцию для записи в файл
-	err = writeToFile("netmap.txt", activeHosts)
+	err = writeToFile(*OutFilename, activeHosts)
 	if err != nil {
 		fmt.Println("Ошибка записи в файл:", err)
 	}
@@ -131,7 +137,7 @@ func isHostActive(host string) bool {
 	}
 	pinger.SetPrivileged(true)
 	pinger.Count = 1
-	pinger.Timeout = timeoutDuration(pingTimeout)
+	pinger.Timeout = timeoutDuration(*PingTimeout)
 
 	err = pinger.Run()
 	if err != nil {
